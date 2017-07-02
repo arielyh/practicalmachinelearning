@@ -1,0 +1,286 @@
+---
+title: "Practical Machine Learning Course Project V2"
+author: "Yue Hou"
+date: "July 2, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# project description
+
+Use the "pml-training" dataset to predict the manner how 6 participants exercise.
+I split the training data (19622 observations) into 60% of train (11776 samples),
+20% of validation (3923) and 20% of test (3923). And used validation set for
+model selection and parameter tuning, at last used test set to calculate the
+out of sample error (accuracy for this multi-class classification problem).
+
+first I cleaned and explored the train data set by removing the NA columns and
+calculating the correlation among pairs of predictors. There are 20 pairs with
+high correlations, so I tried PCA in my modeling methods.
+
+Second, I did the same preprocessing with validation data set (removing NAs).
+Then I tried 4 models (random forest, classificaiton tree, svm and boosting).
+Since this is a classification problem, so I didn't choose regression models.
+For the classification tree and svm, the accuracy on validation set is poor,
+so I also tried PCA on these two methods, but no significant improvement.
+By comparing the 6 methods (rf, tree +/- PCA, svm +/- PCA, boosting) on validation,
+I decided to choose boosting (gbm) model, because it's as accurate as rf, but much faster.
+
+Third, I tried to interpret the prediction variables, so I compared the variance importance
+rank for each method, and plot some scatter and box plot for them vs. output "classe".
+
+Finally, I used the test set (3923 samples, not the "pml-testing" 20 samples for the quiz)
+to calculate the out of sample error.
+
+Conclusion: I used 5-fold cross-validation, center and scale preprocessing for all the models,
+PCA with 90% variance is not better than without PCA. After comparing 4 classification models
+(random forest, svm, classification tree and boosting), I chose boosting because
+it's as accurate as rf, but much faster than rf. SVM and CT are not very accurate, although
+they are kind of fast. The out of sample error on my test_data2 is 0.9964 accuracy.
+
+# Codes
+
+set up working directory
+open the installed [easypackages] library, which can install and open multiple packages simutaneously.
+
+load all needed packages [ggplot2], [corrplot], [gridExtra], [caret] using [easypackages]
+```{r include=FALSE}
+setwd("C:/Courses/Practicle ML in R caret")
+library(easypackages)
+libraries("ggplot2", "corrplot", "gridExtra", "Hmisc", "caTools", "caret", "gbm", "randomForest")
+```
+
+# 1. Data Cleaning and Exloration
+load the training and testing data
+```{r include=FALSE}
+training <- read.csv("~/pml-training.csv")
+testing <- read.csv("~/pml-testing.csv")
+```
+split the training data into train_data (60%), validation_data (20%) and test_data (20%)
+
+set seed for reproducibility
+
+first split training into train (60%) and inBuild (40%), then split inBuild into validation (20%) and test (20%)
+```{r include=FALSE}
+set.seed(1234)
+train_index <- createDataPartition(training$classe, p = 0.6, list = FALSE)
+train_data <- training[train_index, ]   # train data set
+inBuild_data <- training[-train_index, ]
+validation_index <- createDataPartition(inBuild_data$classe, p = 0.5, list = FALSE)
+validation_data <- inBuild_data[validation_index, ]   # validation data set
+test_data <- inBuild_data[-validation_index, ]        # test data set
+```
+```{r}
+dim(train_data); dim(validation_data); dim(test_data)
+```
+
+**wragling train_data**
+
+find all the predictors with NA or blank and then remove them from train_data
+
+create a substitude train_data2 and do cleaning on train_data2
+```{r include=FALSE}
+train_data2 <- train_data
+train_data2[train_data2 == c("", " ")] <- NA    
+train_data2 <- train_data2[, colSums(is.na(train_data2)) == 0]  # delete all columns with "NA"
+```
+check the proportion for each class in train_data: class A is twice size as others, but it's still pretty balanced for each class. 
+```{r}
+prop.table(table(train_data$classe))
+```
+check the predictors (names, type, etc) in train_data, many predictors have NA values.
+```{r}
+str(train_data[, 1:20])
+```
+explorating train_data2: the predictors structure/class, distribution/frequency
+```{r}
+# str(train_data2)
+summary(train_data2[, 1:10])
+```
+col 3 and 7 looks weired, they have lots of same values.
+Draw boxplot of them vs. output "classe"
+```{r plots, echo = FALSE} 
+p1 <- qplot(classe, raw_timestamp_part_1, data = train_data2, fill = classe, 
+            geom = c("boxplot", "jitter"))
+p2 <- qplot(classe, num_window, data = train_data2, fill = classe, 
+            geom = c("boxplot", "jitter"))
+grid.arrange(p1, p2, ncol = 2)
+```
+raw_timestamp_part_1 and num_window looks like a steped increasing data, so keep them.
+
+col 1 "X" is just row index, so delete it.
+
+check the correlation among only numeric variables (from str(train_data2) result, I know that columns 1, 4, 5 and 59 are factor variables.)
+
+select pairs with high correlation (larger than 0.8)
+```{r include=FALSE}
+train_data2 <- train_data2[, -1]
+corr_mat <- abs(cor(train_data2[ , c(2,3,6:58)]))
+diag(corr_mat) <- 0   # make diagnal self-correlation as 0
+corr_pairs <- which(corr_mat > 0.8, arr.ind = T)
+```
+Below indicated that 40 pairs of predictors are highly correlated, might consider using PCA.
+```{r}
+length(corr_pairs)
+```
+# 2. Modeling and Comparing between models
+first select the undeleted predictors' index in train_data2, by finding the matched colnames between validation_data and train_data2.
+```{r include=FALSE}
+match_index <- colnames(validation_data) %in% colnames(train_data2)
+validation_data2 <- validation_data[, match_index]
+```
+```{r}
+dim(validation_data2)
+```
+**then set the trainControl, using 5-fold cross-validation, 'center' and 'scale' preprocess for all models/methods**
+```{r include=FALSE}
+library(caret)
+fitControl <- trainControl(method="cv", number = 5, classProbs = TRUE)
+set.seed(333)
+# rf model
+model_rf <- train(classe ~.,
+                  train_data2,
+                  method = "rf",
+                  preProcess = c('center', 'scale'),
+                  prox = TRUE,
+                  trControl = fitControl)
+pred_rf <- predict(model_rf, validation_data2)
+cm_rf <- confusionMatrix(pred_rf, validation_data2$classe)
+
+# svm
+model_svm <- train(classe ~.,
+                  train_data2,
+                  method = "svmRadial",
+                  preProcess = c('center', 'scale'),
+                  # prox = TRUE,
+                  trControl = fitControl)
+# prediction
+pred_svm <- predict(model_svm, validation_data2)
+# performance
+cm_svm <- confusionMatrix(pred_svm, validation_data2$classe)
+```
+**1. random forest model**
+set seed for reproducibility
+
+Then prediction on validation set, and calculate performance/accuracy on validation set
+```{r}
+cm_rf
+```
+## rf is the most accurate one, but too slow.
+
+**2. svm model with Radial Basis Function Kernel**
+```{r}
+cm_svm
+```
+## svm is 3rd accurate model, and the 3rd fast model.
+
+**3. svm model with PCA**
+PCA components for train and validation set to capture 90% variance
+```{r include=FALSE}
+preProc <- preProcess(train_data2[, -59], method = "pca", thresh = 0.9)
+trainPCA <- predict(preProc, train_data2[, -59])
+trainPCA$classe <- train_data2$classe
+validationPCA <- predict(preProc, validation_data2[, -59])
+validationPCA$classe <- validation_data2$classe
+# svm_pca
+model_svm_pca <- train(classe ~., 
+                       trainPCA,
+                       method = "svmRadial", 
+                       preProcess = c('center', 'scale'),
+                       trControl = fitControl)
+# prediction and performance
+pred_svm_pca <- predict(model_svm_pca, validationPCA)
+cm_svm_pca <- confusionMatrix(pred_svm_pca, validationPCA$classe)
+```
+```{r}
+preProc
+dim(trainPCA); dim(validationPCA)
+cm_svm_pca
+```
+## With PCA is not better than svm.
+
+**4. classification trees**
+```{r include=FALSE}
+model_trees <- train(classe ~.,
+                     train_data2,
+                     method = "rpart",
+                     preProcess = c('center', 'scale'),
+                     # prox = TRUE,
+                     trControl = fitControl)
+# prediction and performance
+pred_trees <- predict(model_trees, validation_data2)
+cm_trees <- confusionMatrix(pred_trees, validation_data2$classe)
+```
+```{r}
+cm_trees
+```
+## Classification Trees model is the fastest, easy to interpret, but least accurate.
+plot trees to interpret predictors
+```{r plot2, echo = FALSE} 
+plot(model_trees$finalModel, uniform = TRUE, main = "Classification Tree Model")
+text(model_trees$finalModel, use.n = TRUE, all = TRUE, cex = 0.6)
+```
+**5. Classification trees with pca**
+```{r include=FALSE}
+model_tree_pca <- train(classe ~., 
+                        trainPCA,
+                        method = "rpart", 
+                        preProcess = c('center', 'scale'),
+                        trControl = fitControl)
+pred_tree_pca <- predict(model_tree_pca, validationPCA)
+cm_tree_pca <- confusionMatrix(pred_tree_pca, validationPCA$classe)
+```
+```{r}
+cm_tree_pca
+```
+## PCA is even worse than classification tree.
+
+**6. Boosting**
+```{r include=FALSE}
+model_boosting <- train(classe ~.,
+                        train_data2,
+                        method = "gbm",
+                        preProcess = c('center', 'scale'),
+                        verbose = FALSE,
+                        trControl = fitControl)
+pred_boosting <- predict(model_boosting, validation_data2)
+cm_boosting <- confusionMatrix(pred_boosting, validation_data2$classe)
+```
+```{r}
+cm_boosting
+```
+## Boosting is the second accurate and the second fast model, my final chosen model.
+# Comparing among models
+collect the resampling results using [resamples] function
+```{r include=FALSE}
+model_list <- list(RF = model_rf,
+                   SVM = model_svm,
+                   SVM_PCA = model_svm_pca,
+                   CT = model_trees,
+                   CT_PCA = model_tree_pca,
+                   GBM = model_boosting)
+
+resamps <- resamples(model_list)
+```
+look at statistical results and boxplot for each model's accuracy
+```{r plot3, echo=FALSE}
+summary(resamps)
+bwplot(resamps, metric = "Accuracy")
+```
+## Boosting is almost as accurate as RF, but way more faster, so finally I chose boosting(GBM). And PCA didn't improve the performance, so don't use PCA.
+
+# 3. Optional: Interpreting predictors by exploring train data and measure variance importance
+
+# 4. Evaluation on Test Set and Quiz
+calculate out of sample error. First select test_data with same variables in preprocessed train_data2
+```{r include=FALSE}
+test_data2 <- test_data[, match_index]
+```
+```{r}
+dim(test_data2)
+confusionMatrix(test_data2$classe, predict(model_boosting, test_data2))
+```
+## so final accuracy using boosting (gbm) is 0.9964.
